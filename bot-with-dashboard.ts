@@ -125,7 +125,8 @@ let CONFIG = {
   },
 
   directTrading: {
-    enabled: false,
+    enabled: process.env.DIRECT_TRADING_ENABLED === 'true' || process.env.VYROBOT_STYLE_ENABLED === 'true',
+    vyrobotStyle: process.env.VYROBOT_STYLE_ENABLED === 'true',
     trendFollowing: true,
     minTrendStrength: 0.02,
     // 🔴 NEW: Stop-loss and take-profit
@@ -925,8 +926,70 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
     }
   }
 
+  const vyrobotCooldowns = new Map<string, number>();
+
+  async function checkVyrobotStyleTrades() {
+    if (!CONFIG.directTrading.enabled || !CONFIG.directTrading.vyrobotStyle || !canTrade()) return;
+
+    try {
+      const markets = await sdk.gammaApi.getTrendingMarkets(20);
+      const now = Date.now();
+
+      for (const market of markets) {
+        if (!market.conditionId) continue;
+        const cooldownUntil = vyrobotCooldowns.get(market.conditionId);
+        if (cooldownUntil && cooldownUntil > now) continue;
+        if (cooldownUntil) vyrobotCooldowns.delete(market.conditionId);
+
+        const fullMarket = await sdk.getMarket(market.conditionId);
+        const tokens = fullMarket.tokens.filter((token: any) => token.tokenId && Number.isFinite(token.price));
+        const candidate = tokens
+          .filter((token: any) => token.price >= 0.65 && token.price <= 0.90)
+          .sort((left: any, right: any) => right.price - left.price)[0];
+
+        if (!candidate) continue;
+
+        const confidence = Number(candidate.price);
+        const confidenceFactor = (confidence - 0.65) / 0.25;
+        const amountUsdc = Math.max(
+          CONFIG.capital.minOrderUsd,
+          Math.min(
+            CONFIG.capital.totalUsd * CONFIG.capital.maxPerTradePct * confidenceFactor,
+            CONFIG.capital.totalUsd * CONFIG.capital.maxPerTradePct
+          )
+        );
+
+        vyrobotCooldowns.set(market.conditionId, now + 6 * 60 * 60 * 1000);
+        const description = `Consensus ${candidate.outcome} ${(confidence * 100).toFixed(1)}%: ${market.question?.slice(0, 55)}`;
+
+        if (CONFIG.dryRun) {
+          simulateTrade(0, 'direct', `[VyRobot-style] BUY $${amountUsdc.toFixed(2)} ${description}`);
+        } else {
+          const result = await sdk.tradingService.createMarketOrder({
+            tokenId: candidate.tokenId,
+            side: 'BUY',
+            amount: amountUsdc,
+          });
+
+          if (result.success) {
+            recordTrade(0, 'direct');
+            log('TRADE', `[VyRobot-style] Bought $${amountUsdc.toFixed(2)} ${description}`);
+          } else {
+            log('WARN', `[VyRobot-style] Trade failed: ${result.errorMsg}`);
+          }
+        }
+      }
+    } catch (err) {
+      log('WARN', `VyRobot-style scan error: ${(err as Error).message}`);
+    }
+  }
+
   // Check every 5 minutes
   setInterval(checkTrendTrades, 5 * 60 * 1000);
+  if (CONFIG.directTrading.vyrobotStyle) {
+    setInterval(checkVyrobotStyleTrades, 5 * 60 * 1000);
+    setTimeout(checkVyrobotStyleTrades, 10000);
+  }
   // Initial check after 10 seconds (let trends stabilize)
   setTimeout(checkTrendTrades, 10000);
 }
